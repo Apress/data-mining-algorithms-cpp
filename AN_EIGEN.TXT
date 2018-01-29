@@ -1,0 +1,116 @@
+class AnalyzeEigenChild {
+
+public:
+   AnalyzeEigenChild ( int npreds , int *preds , int nonpar ) ;
+   ~AnalyzeEigenChild () ;
+
+   int npred ;
+   int preds[MAX_VARS] ;
+   int nonpar ;
+   int n ;        // Size of matrix (number of eigenvalues)
+   double *val ;  // Eigenvalues for display
+} ;
+
+
+/*
+   Allocate memory
+*/
+
+   cumulative = (double *) malloc ( npred * sizeof(double) ) ;
+   covar = (double *) malloc ( npred * npred * sizeof(double) ) ;
+   evals = (double *) malloc ( npred * sizeof(double) ) ;
+   structure = (double *) malloc ( npred * npred * sizeof(double) ) ;
+   means = (double *) malloc ( npred * sizeof(double) ) ;
+   stddev = (double *) malloc ( npred * sizeof(double) ) ;
+
+/*
+   Compute means (means) and standard deviations (stddev)
+*/
+
+   for (i=0 ; i<npred ; i++)
+      means[i] = stddev[i] = 1.e-60 ;
+
+   for (i=0 ; i<n_cases ; i++) {
+      for (j=0 ; j<npred ; j++)
+         means[j] += database[i*n_vars+preds[j]] ;
+      }
+
+   for (j=0 ; j<npred ; j++)
+      means[j] /= n_cases ;
+
+   for (i=0 ; i<n_cases ; i++) {
+      for (j=0 ; j<npred ; j++) {
+         diff = database[i*n_vars+preds[j]] - means[j] ;
+         stddev[j] += diff * diff ;
+         }
+      }
+
+   for (j=0 ; j<npred ; j++)
+      stddev[j] = sqrt ( stddev[j] / n_cases ) ;
+
+/*
+   Compute correlation matrix 'covar'
+*/
+
+   for (i=1 ; i<npred ; i++) {
+      for (j=0 ; j<i ; j++)
+         covar[i*npred+j] = 0.0 ;
+      }
+
+   for (i=0 ; i<n_cases ; i++) {
+      for (j=1 ; j<npred ; j++) {
+         diff = (database[i*n_vars+preds[j]] - means[j]) / stddev[j] ;
+         for (k=0 ; k<j ; k++) {
+            diff2 = (database[i*n_vars+preds[k]] - means[k]) / stddev[k] ;
+            covar[j*npred+k] += diff * diff2 ;
+            }
+         }
+      }
+
+   for (j=1 ; j<npred ; j++) {
+      for (k=0 ; k<j ; k++)
+         covar[j*npred+k] /= n_cases ;
+      }
+
+   for (j=0 ; j<npred ; j++) {
+      covar[j*npred+j] = 1.0 ;
+      for (k=j+1 ; k<npred ; k++)
+         covar[j*npred+k] = covar[k*npred+j] ;  // May be needed for some evect routines
+      }                                         // But not evec_rs(), so may be omitted!
+
+/*
+   Compute eigenvalues/vectors
+*/
+
+   evec_rs ( covar , npred , 1 , structure , evals , means ) ;
+
+   sum = 0.0 ;
+   for (i=0 ; i<npred ; i++) {   // We display cumulative eigenvalues
+      if (evals[i] < 0.0)  // Happens only from tiny fpt errors
+         evals[i] = 0.0 ;
+      sum += evals[i] ;
+      cumulative[i] = sum ;
+      }
+
+   for (i=0 ; i<npred ; i++)     // Make it percent
+      cumulative[i] = 100.0 * cumulative[i] / sum ;
+
+/*
+   Compute the factor structures by multiplying each eigenvector
+   by the square root of its eigenvalue
+*/
+
+   for (i=0 ; i<eigen_npred ; i++) {
+      for (j=0 ; j<eigen_npred ; j++) {
+         structure[i*npred+j] *= sqrt(evals[j]) ;
+         if (structure[i*npred+j] < -1.0)  // In a perfect fpt world this would never happen
+            structure[i*npred+j] = -1.0 ;
+         if (structure[i*npred+j] > 1.0)
+            structure[i*npred+j] = 1.0 ;
+         }
+      }
+
+   free ( covar ) ;
+   free ( means ) ;
+   free ( stddev ) ;
+}

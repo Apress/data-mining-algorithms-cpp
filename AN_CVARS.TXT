@@ -1,0 +1,159 @@
+/******************************************************************************/
+/*                                                                            */
+/*  AN_CVARS - AnalyzeClusterVars operations                                  */
+/*                                                                            */
+/******************************************************************************/
+
+int an_cvars (
+   int n_dim ,          // Number of initial dimensions to consider
+   int ngrp_to_print ,  // Start printing when n of groups drops this low
+   int type             // Centroid versus leader method
+   )
+{
+   int i, j, nvars, icand1, icand2, ibest1, ibest2, n_groups ;
+   int *group_id, *n_in_group ;
+   double x, dotprod, length, best_dotprod, *centroids ;
+   char msg[256], msg2[256] ;
+
+   n_groups = npred ;   // Number of groups; initially, every variable is its own group
+   nvars = npred ;      // This name just makes things more clear; no other reason
+
+/*
+   Allocate memory
+*/
+
+   group_id = (int *) malloc ( nvars * sizeof(int) ) ;
+   n_in_group = (int *) malloc ( nvars * sizeof(int) ) ;
+   centroids = (double *) malloc ( nvars * n_dim * sizeof(double) ) ;
+
+/*
+   Initialize; For each variable, make the length of the vector one
+*/
+
+   for (i=0 ; i<nvars ; i++) {
+      group_id[i] = i ;          // For each variable, this is the group to which it belongs
+      n_in_group[i] = 1 ;        // Size of each group
+      length = 0.0 ;             // Will cumulate length of this variable's vector
+      for (j=0 ; j<n_dim ; j++)
+         length += structure[i*nvars+j] * structure[i*nvars+j] ;
+      length = 1.0 / sqrt ( length ) ;
+      for (j=0 ; j<n_dim ; j++)  // Normalize the length of this variable's vector
+         centroids[i*n_dim+j] = length * structure[i*nvars+j] ;
+      }
+
+/*
+   Print normalized factors
+*/
+
+   audit ( "" ) ;
+   audit ( "" ) ;
+   audit ( "Relevant factors, after normalization" ) ;
+   audit ( "" ) ;
+
+   for (i=0 ; i<nvars ; i++) {
+      sprintf_s ( msg, "%15s %8.4lf", var_names[preds[i]], centroids[i*n_dim+0] ) ;
+      for (j=1 ; j<n_dim ; j++) {
+         sprintf_s ( msg2 , "%8.4lf", centroids[i*n_dim+j] ) ;
+         strcat_s ( msg , msg2 ) ;
+         }
+      audit ( msg ) ;
+      }
+   audit ( "" ) ;
+
+/*
+   Hierarchical grouping
+*/
+
+   while (n_groups > 1) {
+      best_dotprod = -1.0 ;
+
+      // Try every pair of groups (icand1 and icand2)
+      for (icand1=0 ; icand1<n_groups-1 ; icand1++) {
+         for (icand2=icand1+1 ; icand2<n_groups ; icand2++) {
+
+            // The distance measure is based on the angle between two variables
+            // Because the two vectors are unit length, their dot product is the cosine of the angle between them.
+            // The negative of a variable is equivalent to the variable, so check both via symmetry
+            dotprod = 0.0 ;
+            for (i=0 ; i<n_dim ; i++)
+               dotprod += centroids[icand1*n_dim+i] * centroids[icand2*n_dim+i] ;
+            dotprod = fabs ( dotprod ) ;   // Handle symmetry
+
+            if (dotprod > best_dotprod) {  // Keep track of the pair with best criterion
+               best_dotprod = dotprod ;
+               ibest1 = icand1 ; 
+               ibest2 = icand2 ;
+               }
+
+            } // For icand2
+         } // For icand1
+
+      // We just found the closest pair.  Merge larger index into smaller.
+
+      if (best_dotprod > 1.0)   // Should never happen, but handle tiny fpt errors
+         best_dotprod = 1.0 ;
+
+      sprintf_s ( msg , "Merged groups %d and %d separated by %.2lf degrees; now have %d groups",
+                  ibest1+1, ibest2+1, acos(best_dotprod)*180.0/PI, n_groups-1 ) ;
+      audit ( msg ) ;
+
+      if (type) {  // Did the user request centroid method?
+         // Recompute the (approximate) centroid of the absorbing (smaller id) group
+         length = 0.0 ;
+         for (j=0 ; j<n_dim ; j++) {
+            x = (n_in_group[ibest1] * centroids[ibest1*n_dim+j] +
+                 n_in_group[ibest2] * centroids[ibest2*n_dim+j]) /
+                (n_in_group[ibest1] + n_in_group[ibest2]) ;
+            centroids[ibest1*n_dim+j] = x ;
+            length += x * x ;
+            }
+         length = 1.0 / sqrt ( length ) ;
+         for (j=0 ; j<n_dim ; j++)
+            centroids[ibest1*n_dim+j] *= length ;  // The length must always be one
+         } // If type is centroid (not leader)
+
+      n_in_group[ibest1] += n_in_group[ibest2] ;  // Group 1 just absorbed group 2
+
+      // Remap the largest and then pull down all groups above largest.
+      for (i=0 ; i<nvars ; i++) {
+         if (group_id[i] == ibest2)  // If this variable was in Group 2
+            group_id[i] = ibest1 ;   // Reclassify it as being in Group 1, the absorbing group
+         if (group_id[i] > ibest2)   // Groups above absorbed group
+            --group_id[i] ;          // Now have to fill in the hole below them
+         }
+
+      for (i=ibest2+1 ; i<n_groups ; i++) {  // Crunch down group stuff above the absorbed group
+         n_in_group[i-1] = n_in_group[i] ;
+         for (j=0 ; j<n_dim ; j++)
+            centroids[(i-1)*n_dim+j] = centroids[i*n_dim+j] ;
+         }
+
+      --n_groups ;    // We just lost a group (ibest2 was absorbed into ibest1)
+
+/*
+   Print group membership info
+*/
+
+      if (n_groups <= ngrp_to_print  &&  n_groups > 1) {
+         audit ( "Group membership..." ) ;
+         for (i=0 ; i<n_groups ; i++) {
+            sprintf_s ( msg , "   Group %d", i+1 ) ;
+            audit ( msg ) ;
+            for (j=0 ; j<nvars ; j++) {
+               if (group_id[j] == i) {
+                  sprintf_s ( msg , "      %s", var_names[preds[j]] ) ;
+                  audit ( msg ) ;
+                  }
+               }
+            }
+         }
+
+      } // while (n_groups > 1)
+
+FINISH:
+   free ( group_id ) ;
+   free ( n_in_group ) ;
+   free ( centroids ) ;
+
+   return 0 ;
+}

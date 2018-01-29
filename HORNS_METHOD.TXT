@@ -1,0 +1,259 @@
+typedef struct {
+   int nc ;             // Number of cases
+   int nv ;             // Number of variables
+   double *covar ;      // Scratch for covariance matrix
+   double *evals ;      // Computed eigenvalues
+   double *workv ;      // Scratch vector for evec_rs()
+   int ieval ;          // Needed for placing result in all_evals
+} MC_EVALS_PARAMS ;
+
+static unsigned int __stdcall evals_threaded ( LPVOID dp )
+{
+   int i, j, icase, n_cases, n_vars ;
+   double *xvec, *sums, *covar, xtemp, *evals, *workv ;
+
+   n_cases = ((MC_EVALS_PARAMS *) dp)->nc ;
+   n_vars = ((MC_EVALS_PARAMS *) dp)->nv ;
+   covar = ((MC_EVALS_PARAMS *) dp)->covar ;
+   xvec = evals = ((MC_EVALS_PARAMS *) dp)->evals ;   // We borrow this for computing covar
+   sums = workv = ((MC_EVALS_PARAMS *) dp)->workv ;  // Ditto
+
+/*
+   Compute the lower-left triangle of the covariance matrix of a
+   standardized, uncorrelated normal random variable.
+   The upper-right triangle is ignored by the evec_rs() routine.
+*/
+
+   for (i=0 ; i<n_vars ; i++) {
+      sums[i] = 0.0 ;
+      for (j=0 ; j<=i ; j++)
+         covar[i*n_vars+j] = 0.0 ;
+      }
+
+
+   for (icase=0 ; icase<n_cases ; icase++) {
+
+      // Generate the random vector
+      for (i=0 ; i<n_vars ; i++) {
+         if (i % 2 == 0)
+            normal_pair ( &xvec[i] , &xtemp ) ;
+         else
+            xvec[i] = xtemp ;
+         }
+
+      // Cumulate for this random vector
+      for (i=0 ; i<n_vars ; i++) {
+         sums[i] += xvec[i] ;
+         for (j=0 ; j<=i ; j++)
+            covar[i*n_vars+j] += xvec[i] * xvec[j] ;
+         }
+      } // For all cases
+
+   // Compute n_cases times covariances
+   for (i=0 ; i<n_vars ; i++) {
+      for (j=0 ; j<=i ; j++)
+         covar[i*n_vars+j] -= sums[i] * sums[j] / n_cases ;
+      }
+
+   // Compute correlation matrix
+
+   for (i=0 ; i<n_vars ; i++) {
+      covar[i*n_vars+i] = sqrt ( covar[i*n_vars+i] ) ;
+      for (j=0 ; j<i ; j++)
+         covar[i*n_vars+j] /= covar[i*n_vars+i] * covar[j*n_vars+j] ;
+      }
+
+   for (i=0 ; i<n_vars ; i++)   // Definition of correlation matrix
+      covar[i*n_vars+i] = 1.0 ;
+
+   evec_rs ( covar , n_vars , 0 , covar , evals , workv ) ;
+
+   return 0 ;
+}
+
+int mc_evals (
+   int nc ,               // Number of cases
+   int nv ,               // Number of variables
+   int mc_reps ,          // Number of MC replications
+   int max_threads ,      // Max number of threads to use
+   double fractile ,      // Desired fractile, 0-1
+   double *threshold      // Computed values of each eval for specified fractile
+   )
+{
+   int i, j, k, ieval, ithread, n_threads, empty_slot, ret_val ;
+   double *covar ;         // Scratch for covariance matrix, nv*nv*max_threads
+   double *evals ;         // Scratch for eigenvalues, nv*max_threads
+   double *workv ;         // Scratch for evec_rs()
+   double *all_evals ;     // Scratch for all eigenvalues, nv*mc_reps
+   char msg[256] ;
+   MC_EVALS_PARAMS mc_evals_params[MAX_THREADS] ;
+   HANDLE threads[MAX_THREADS] ;
+
+   if (mc_reps < 1)
+      mc_reps = 1 ;
+
+   if (max_threads > mc_reps)
+      max_threads = mc_reps ;
+
+/*
+   Allocate memory
+*/
+
+   covar = (double *) malloc ( nv * nv * max_threads * sizeof(double) ) ;
+   evals = (double *) malloc ( nv * max_threads * sizeof(double) ) ;
+   workv = (double *) malloc ( nv * max_threads * sizeof(double) ) ;
+   all_evals = (double *) malloc ( nv * mc_reps * sizeof(double) ) ;
+
+/*
+--------------------------------------------------------------------------------
+
+   Outer-most loop does threaded MC replications
+   Initialize those thread parameters which are constant for all threads.
+
+--------------------------------------------------------------------------------
+*/
+
+   for (ithread=0 ; ithread<max_threads ; ithread++) {
+      mc_evals_params[ithread].nc = nc ;
+      mc_evals_params[ithread].nv = nv ;
+      mc_evals_params[ithread].covar = covar + ithread * nv * nv ;
+      mc_evals_params[ithread].evals = evals + ithread * nv ;
+      mc_evals_params[ithread].workv = workv + ithread * nv ;
+      } // For all threads, initializing constant stuff
+
+
+/*
+   Do it
+*/
+
+   n_threads = 0 ;                    // Counts threads that are active
+   for (i=0 ; i<max_threads ; i++)
+      threads[i] = NULL ;
+
+   ieval = 0 ;        // Index of this replication in all_evals
+   empty_slot = -1 ;  // After full, will identify the thread that just completed
+   for (;;) {         // Main thread loop processes all replications
+
+/*
+   Handle user ESCape
+*/
+
+      if (escape_key_pressed  ||  user_pressed_escape ()) {
+         for (i=0, k=0 ; i<max_threads ; i++) {
+            if (threads[i] != NULL)
+               threads[k++] = threads[i] ;
+            }
+         ret_val = WaitForMultipleObjects ( k , threads , TRUE , 50000 ) ;
+         for (i=0 ; i<k ; i++)
+            CloseHandle ( threads[i] ) ;
+         ret_val = ERROR_ESCAPE ;
+         goto FINISH ;
+         }
+
+/*
+   Start a new thread if we still have work to do
+*/
+
+      if (ieval < mc_reps) {    // If there are still some to do
+         if (empty_slot < 0)    // Negative while we are initially filling the queue
+            k = n_threads ;
+         else
+            k = empty_slot ;
+         mc_evals_params[k].ieval = ieval  ;         // Needed for placing final result in all_evals
+         threads[k] = (HANDLE) _beginthreadex ( NULL , 0 , evals_threaded , &mc_evals_params[k] , 0 , NULL ) ;
+         if (threads[k] == NULL) {
+            for (i=0 ; i<n_threads ; i++) {
+               if (threads[i] != NULL)
+                  CloseHandle ( threads[i] ) ;
+               }
+            ret_val = ERROR_INSUFFICIENT_MEMORY ;
+            goto FINISH ;
+            }
+         ++n_threads ;
+         ++ieval ;
+         } // if (ieval < mc_reps)
+
+      if (n_threads == 0)  // Are we done?
+         break ;
+
+/*
+   Handle full suite of threads running and more threads to add as soon as some are done.
+   Wait for just one thread to finish.
+*/
+
+      if (n_threads == max_threads  &&  ieval < mc_reps) {
+         ret_val = WaitForMultipleObjects ( n_threads , threads , FALSE , 500000 ) ;
+         if (ret_val == WAIT_TIMEOUT  ||  ret_val == WAIT_FAILED  ||  ret_val < 0  ||  ret_val >= n_threads) {
+            ret_val = ERROR_INSUFFICIENT_MEMORY ;
+            goto FINISH ;
+            }
+
+         k = mc_evals_params[ret_val].ieval ;
+         for (i=0 ; i<nv ; i++)
+            all_evals[i*mc_reps+k] = mc_evals_params[ret_val].evals[i] ;
+
+         empty_slot = ret_val ;
+         CloseHandle ( threads[empty_slot] ) ;
+         threads[empty_slot] = NULL ;
+         --n_threads ;
+         }
+
+/*
+   Handle all work has been started and now we are just waiting for threads to finish
+*/
+
+      else if (ieval == mc_reps) {
+         ret_val = WaitForMultipleObjects ( n_threads , threads , TRUE , 500000 ) ;
+         if (ret_val == WAIT_TIMEOUT  ||  ret_val == WAIT_FAILED  ||  ret_val < 0  ||  ret_val >= n_threads) {
+            ret_val = ERROR_INSUFFICIENT_MEMORY ;
+            goto FINISH ;
+            }
+          for (i=0 ; i<n_threads ; i++) {
+            k = mc_evals_params[i].ieval ;
+            for (j=0 ; j<nv ; j++) {
+               all_evals[j*mc_reps+k] = mc_evals_params[i].evals[j] ;
+               }
+
+            CloseHandle ( threads[i] ) ;
+            }
+
+         break ;
+         }
+      } // Endless loop which threads computation of evals for all reps
+
+
+
+/*
+   All eigenvalues are computed and saved.  Compute specified fractile for each.
+*/
+
+   k = (int) (fractile * (mc_reps+1)) - 1 ;
+   if (k < 0)
+      k = 0 ;
+   if (k >= mc_reps)
+      k = mc_reps - 1 ;
+
+   for (i=0 ; i<nv ; i++) {
+      qsortd ( 0 , mc_reps-1 , all_evals + i * mc_reps ) ;
+      threshold[i] = all_evals[i*mc_reps+k] ;
+      }
+
+   ret_val = 0 ;
+
+
+/*
+   Finished.  Clean up and exit.
+*/
+
+FINISH:
+   if (covar != NULL)
+      free ( covar ) ;
+   if (evals != NULL)
+      free ( evals ) ;
+   if (workv != NULL)
+      free ( workv ) ;
+   if (all_evals != NULL)
+      free ( all_evals ) ;
+
+   return ret_val ;
+}

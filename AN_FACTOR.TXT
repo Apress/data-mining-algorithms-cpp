@@ -1,0 +1,817 @@
+/*
+--------------------------------------------------------------------------------
+
+   External declarations for globals which may be used for rotation or display
+
+--------------------------------------------------------------------------------
+*/
+
+extern int eigen_npred ;           // Number of variables (generally predictors)
+extern int eigen_preds[MAX_VARS] ; // Their indices in database
+extern int eigen_n_dim ;           // User-specified number of unobserved factors
+extern double *eigen_evals ;
+extern double *eigen_structure ;
+extern double *eigen_phi ;
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Class declaration
+
+--------------------------------------------------------------------------------
+*/
+
+class AnalyzeFactorChild {
+
+public:
+   AnalyzeFactorChild ( int npreds , int *preds , int n_dim , int nonpar ) ;
+   ~AnalyzeFactorChild () ;
+   int AnalyzeFactorChild::EMstep () ;
+   void AnalyzeFactorChild::QUADstep ( double *LL ) ;
+   double AnalyzeFactorChild::log_lik ( double *theta ) ;
+   double AnalyzeFactorChild::log_lik_fast ( double *theta ) ;
+
+   int error ;
+   int npred ;
+   int n_dim ;
+   int preds[MAX_VARS] ;
+   int nonpar ;
+   int n ;        // Size of matrix (number of eigenvalues)
+   // Work areas for optimization
+   double *covar ;
+   double *Amat ;
+   double *Fmat ;
+   double *Gmat ;
+   double *Hmat ;
+   double *PSIvec ;
+   double *TEMPmat1 ;
+   double *TEMPmat2 ;
+   double *invert_rwork ;
+   int *invert_iwork ;
+   // Work areas specifically for QUADstep
+   double *theta_t ;
+   double *theta_tm1 ;
+   double *theta_tm2 ;
+   double *trial_theta ;
+   double *best_theta ;
+   double LL_t ;
+   double LL_tm1 ;
+   double LL_tm2 ;
+   double LL1 ;
+   double LL2 ;
+   double LL3 ;
+   double LL4 ;
+} ;
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Constructor and Destructor
+
+--------------------------------------------------------------------------------
+*/
+
+AnalyzeFactorChild::AnalyzeFactorChild ( int np , int *p , int nd , int nonp )
+{
+   int icase, i, j, k, iter, im1, ibig, EMreverse ;
+   double *work1, *work2, diff, diff2, sum, *nonpar_work, LL ;
+   double improvement, first_improvement, big ;
+   double max_change, convergence_counter ;
+
+   eigen_npred = npred = np ;
+   eigen_n_dim = n_dim = nd ;
+   nonpar = nonp ;
+   for (i=0 ; i<np ; i++)
+      eigen_preds[i] = preds[i] = p[i] ;
+
+   error = 0 ;
+
+/*
+   Allocate memory
+*/
+
+   if (eigen_evals != NULL)
+      free ( eigen_evals ) ;
+   if (eigen_structure != NULL)
+      free ( eigen_structure ) ;
+   if (eigen_phi != NULL)
+      free ( eigen_phi ) ;
+   val = (double *) malloc ( npred * sizeof(double) ) ;
+   eigen_evals = (double *) malloc ( npred * sizeof(double) ) ;
+   eigen_structure = (double *) malloc ( npred * npred * sizeof(double) ) ;
+   eigen_phi = (double *) malloc ( npred * sizeof(double) ) ;
+   work1 = (double *) malloc ( npred * sizeof(double) ) ;  // Used for means and evec_rs()
+   work2 = (double *) malloc ( npred * sizeof(double) ) ;  // Used for stddev
+   covar = (double *) malloc ( npred * npred * sizeof(double) ) ;
+   Amat = (double *) malloc ( npred * n_dim * sizeof(double) ) ;
+   Fmat = (double *) malloc ( npred * n_dim * sizeof(double) ) ;
+   Gmat = (double *) malloc ( npred * n_dim * sizeof(double) ) ;
+   Hmat = (double *) malloc ( npred * n_dim * sizeof(double) ) ;
+   PSIvec = (double *) malloc ( npred * sizeof(double) ) ;
+   TEMPmat1 = (double *) malloc ( npred * npred * sizeof(double) ) ;
+   TEMPmat2 = (double *) malloc ( npred * npred * sizeof(double) ) ;
+   invert_rwork = (double *) malloc ( (npred * npred + 2 * npred) * sizeof(double) ) ;
+   invert_iwork = (int *) malloc ( npred * sizeof(int) ) ;
+   k = npred * n_dim + npred ;  // Number of parameters
+   theta_t = (double *) malloc ( 5 * k * sizeof(double) ) ;
+   if (nonpar)
+      nonpar_work = (double *) malloc ( 2 * n_cases * sizeof(double) ) ;  // Used for nonpar corr
+   else
+      nonpar_work = NULL ;
+
+   theta_tm1 = theta_t + k ;
+   theta_tm2 = theta_tm1 + k ;
+   trial_theta = theta_tm2 + k ;
+   best_theta = trial_theta + k ;
+
+/*
+   If nonparametric, compute correlation matrix
+*/
+
+   if (nonpar) {
+      k = 0 ;
+      for (i=1 ; i<npred ; i++) {
+         for (j=0 ; j<i ; j++) {
+            for (icase=0 ; icase<n_cases ; icase++) {
+               nonpar_work[icase] = database[icase*n_vars+preds[i]] ;
+               nonpar_work[n_cases+icase] = database[icase*n_vars+preds[j]] ;
+               }
+            covar[i*npred+j] = spearman ( n_cases , nonpar_work , nonpar_work+n_cases , nonpar_work , nonpar_work+n_cases ) ;
+            ++k ;
+            }
+         }
+      }
+
+/*
+   Else not nonparametric, so compute means (work1) and standard deviations (work2)
+*/
+
+   else {
+      for (i=0 ; i<npred ; i++)
+         work1[i] = work2[i] = 1.e-60 ;
+
+      for (i=0 ; i<n_cases ; i++) {
+         for (j=0 ; j<npred ; j++)
+            work1[j] += database[i*n_vars+preds[j]] ;
+         }
+
+      for (j=0 ; j<npred ; j++)
+         work1[j] /= n_cases ;
+
+      for (i=0 ; i<n_cases ; i++) {
+         for (j=0 ; j<npred ; j++) {
+            diff = database[i*n_vars+preds[j]] - work1[j] ;
+            work2[j] += diff * diff ;
+            }
+         }
+
+      for (j=0 ; j<npred ; j++)
+         work2[j] = sqrt ( work2[j] / n_cases ) ;
+
+/*
+   Compute correlation matrix 'covar'
+*/
+
+      for (i=1 ; i<npred ; i++) {
+         for (j=0 ; j<i ; j++)
+            covar[i*npred+j] = 0.0 ;
+         }
+
+      for (i=0 ; i<n_cases ; i++) {
+         for (j=1 ; j<npred ; j++) {
+            diff = (database[i*n_vars+preds[j]] - work1[j]) / work2[j] ;
+            for (k=0 ; k<j ; k++) {
+               diff2 = (database[i*n_vars+preds[k]] - work1[k]) / work2[k] ;
+               covar[j*npred+k] += diff * diff2 ;
+               }
+            }
+         }
+
+      for (j=0 ; j<npred ; j++) {
+         for (k=0 ; k<j ; k++)
+            covar[j*npred+k] /= n_cases ;
+         }
+      } // Else not nonpar, so compute means, stddev, correl
+
+/*
+   The strict lower triangle has been computed.  Fill in diagonal and upper triangle.
+*/
+
+   for (j=0 ; j<npred ; j++) {
+      covar[j*npred+j] = 1.0 ;
+      for (k=j+1 ; k<npred ; k++)
+         covar[j*npred+k] = covar[k*npred+j] ;  // Needed for EMstep()
+      }
+
+/*
+   Compute eigenvalues and vectors
+   Compute the factor structures by multiplying each eigenvector
+   by the square root of its eigenvalue.
+   Also initialize the A matrix for optimization.
+*/
+
+   evec_rs ( covar , npred , 1 , eigen_structure , eigen_evals , work1 ) ;
+
+   for (i=0 ; i<npred ; i++) {
+      for (j=0 ; j<npred ; j++) {
+         eigen_structure[i*npred+j] *= sqrt(eigen_evals[j]) ;
+         if (eigen_structure[i*npred+j] < -1.0)  // In a perfect fpt world this would never happen
+            eigen_structure[i*npred+j] = -1.0 ;
+         if (eigen_structure[i*npred+j] > 1.0)
+            eigen_structure[i*npred+j] = 1.0 ;
+         if (j < n_dim)
+            Amat[i*n_dim+j] = eigen_structure[i*npred+j] ;
+         }
+      }
+
+/*
+   Compute initial Psi as 1.0 (diagonal of covar, 1) minus communality.
+   It must always be positive, and numerics get flaky when it approaches zero.
+*/
+
+   for (i=0 ; i<npred ; i++) {
+      eigen_phi[i] = 1.0 ;
+      for (j=0 ; j<n_dim ; j++)
+         eigen_phi[i] -= eigen_structure[i*npred+j] * eigen_structure[i*npred+j] ;
+      if (eigen_phi[i] < 1.e-3)
+         eigen_phi[i] = 1.e-3 ;
+      PSIvec[i] = eigen_phi[i] ; // Initialize for optimization
+      }
+
+/*
+   Optimization loop starts here (after a bit of initialization)
+*/
+
+   memcpy ( theta_tm1 , PSIvec , npred * sizeof(double) ) ;
+   memcpy ( theta_tm1+npred , Amat , npred * n_dim * sizeof(double) ) ;
+   LL_tm1 = log_lik_fast ( theta_tm1 ) ;
+
+   if (EMstep ()) {
+      // Issue error message here
+      goto FACTOR_FINISH ;
+      }
+
+   memcpy ( theta_t , PSIvec , npred * sizeof(double) ) ;
+   memcpy ( theta_t+npred , Amat , npred * n_dim * sizeof(double) ) ;
+   LL_t = log_lik_fast ( theta_t ) ;
+
+   EMreverse = 0 ;   // Will count a very rare pathological event that can cause endless looping
+
+   for (iter=0 ; iter<10000 ; iter++) {
+
+      // Right now, theta_t is Amat, tm1 is defined, and tm2 need not be defined (about to be!)
+
+      if (EMstep ()) {   // This takes and returns PSIvec and Amat without touching theta_t
+         // Issue error message here
+         break ;
+         }
+
+      memcpy ( theta_tm2 , theta_tm1 , npred * sizeof(double) ) ;
+      memcpy ( theta_tm2+npred , theta_tm1+npred , npred * n_dim * sizeof(double) ) ;
+      LL_tm2 = LL_tm1 ;
+      memcpy ( theta_tm1 , theta_t , npred * sizeof(double) ) ; // Theta_t was not touched by EM, so it's prior to EM
+      memcpy ( theta_tm1+npred , theta_t+npred , npred * n_dim * sizeof(double) ) ;
+      LL_tm1 = LL_t ;
+
+      memcpy ( theta_t , PSIvec , npred * sizeof(double) ) ;  // This is what the EM step just computed
+      memcpy ( theta_t+npred , Amat , npred * n_dim * sizeof(double) ) ;
+      LL_t = log_lik_fast ( theta_t ) ;
+
+      // Now, tm2 is after EM before this one, tm1 is after QUAD, and t is after this EM
+
+      if (LL_t < LL_tm1) {
+         ++EMreverse ;
+         if (EMreverse > 10) {
+            // Issue error message here
+            break ;
+            }
+         }
+
+      QUADstep ( &LL ) ;   // Takes theta_t, tm1, and tm2 as input and computes PSIvec and Amat
+                           // The trio of points is: finished EM, finished QUAD, finished EM.
+
+      memcpy ( theta_tm1 , theta_t , npred * sizeof(double) ) ;
+      memcpy ( theta_tm1+npred , theta_t+npred , npred * n_dim * sizeof(double) ) ;
+      LL_tm1 = LL_t ;      // This came from EM above
+      memcpy ( theta_t , PSIvec , npred * sizeof(double) ) ;
+      memcpy ( theta_t+npred , Amat , npred * n_dim * sizeof(double) ) ;
+      LL_t = LL ;          // This came from the QUADstep we just did
+
+      // Now, tm1 is after recent EM, t is after this QUAD, and tm2 is still after EM before most recent EM
+
+      // Check for convergence: No significant parameter change several iters in a row
+      // What intervened in this change check is QUAD, EM, QUAD.
+
+      max_change = 0.0 ;
+      for (i=0 ; i<npred+npred*n_dim ; i++) {
+         diff = fabs ( theta_t[i] - theta_tm2[i] ) ;
+         if (diff > max_change)
+            max_change = diff ;
+         }
+      if (max_change < 1.e-6)
+         ++convergence_counter ;
+      else
+         convergence_counter = 0 ;
+      if (convergence_counter > 2)
+         break ;
+      }
+
+/*
+   Copy results to global area
+*/
+
+   for (i=0 ; i<npred ; i++) {
+      eigen_phi[i] = PSIvec[i] ;
+      for (j=0 ; j<n_dim ; j++)
+         eigen_structure[i*npred+j] = Amat[i*n_dim+j] ;
+      }
+
+   for (j=0 ; j<n_dim ; j++) {
+      sum = 0.0 ;
+      for (i=0 ; i<npred ; i++)
+         sum += Amat[i*n_dim+j] * Amat[i*n_dim+j] ;
+      eigen_evals[j] = sum ;
+      }
+
+
+/*
+   Sort per column squared length
+*/
+
+
+   for (i=1 ; i<n_dim ; i++) {
+      im1 = i - 1 ;
+      ibig = im1 ;
+      big = eigen_evals[im1] ;
+      /*  Find largest eval beyond im1  */
+      for (j=i ; j<n_dim ; j++) {
+         if (eigen_evals[j] > big) {
+            big = eigen_evals[j] ;
+            ibig = j ;
+            }
+         }
+      if (ibig != im1) {   // Do we need to swap ibig and im1?
+         eigen_evals[ibig] = eigen_evals[im1] ;
+         eigen_evals[im1] = big ;
+         for (j=0 ; j<npred ; j++) {
+            sum = eigen_structure[j*npred+im1] ;
+            eigen_structure[j*npred+im1] = eigen_structure[j*npred+ibig] ;
+            eigen_structure[j*npred+ibig] = sum ;
+            }
+         }
+      }
+
+FACTOR_FINISH:
+   free ( covar ) ;
+   free ( work1 ) ;
+   free ( work2 ) ;
+   free ( Amat ) ;
+   free ( Fmat ) ;
+   free ( Gmat ) ;
+   free ( Hmat ) ;
+   free ( PSIvec ) ;
+   free ( TEMPmat1 ) ;
+   free ( TEMPmat2 ) ;
+   free ( invert_rwork ) ;
+   free ( invert_iwork ) ;
+   free ( theta_t ) ;
+   if (nonpar_work != NULL)
+      free ( nonpar_work ) ;
+}
+
+AnalyzeFactorChild::~AnalyzeFactorChild ()
+{
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   EMstep does a single EM step
+
+--------------------------------------------------------------------------------
+*/
+
+int AnalyzeFactorChild::EMstep ()
+{
+   int i, j, k ;
+   double sum ;
+
+/*
+   Compute F = PsiInverse A
+*/
+
+   for (i=0 ; i<npred ; i++) {
+      for (j=0 ; j<n_dim ; j++)
+         Fmat[i*n_dim+j] = Amat[i*n_dim+j] / PSIvec[i] ;
+      }
+
+/*
+   Compute G = covar F
+*/
+
+   for (i=0 ; i<npred ; i++) {
+      for (j=0 ; j<n_dim ; j++) {
+         sum = 0.0 ;
+         for (k=0 ; k<npred ; k++)
+            sum += covar[i*npred+k] * Fmat[k*n_dim+j] ;
+         Gmat[i*n_dim+j] = sum ;
+         }
+      }
+
+/*
+   Compute H in multiple steps
+*/
+
+   // (A'F + I)^-1
+   for (i=0 ; i<n_dim ; i++) {
+      for (j=0 ; j<n_dim ; j++) {
+         sum = 0.0 ;
+         for (k=0 ; k<npred ; k++)
+            sum += Amat[k*n_dim+i] * Fmat[k*n_dim+j] ;
+         TEMPmat1[i*n_dim+j] = sum ;
+         }
+      TEMPmat1[i*n_dim+i] += 1.0 ;  // This is where we add in the identity matrix
+      }
+   k = invert ( n_dim , TEMPmat1 , TEMPmat2 , &sum , invert_rwork , invert_iwork ) ;
+   if (k)
+      return 1 ;
+
+   // G times above
+
+   for (i=0 ; i<npred ; i++) {
+      for (j=0 ; j<n_dim ; j++) {
+         sum = 0.0 ;
+         for (k=0 ; k<n_dim ; k++)
+            sum += Gmat[i*n_dim+k] * TEMPmat2[k*n_dim+j] ;
+         Hmat[i*n_dim+j] = sum ;
+         }
+      }
+
+/*
+   Update A in several steps
+*/
+
+   // (H'F + I)^-1
+   for (i=0 ; i<n_dim ; i++) {
+      for (j=0 ; j<n_dim ; j++) {
+         sum = 0.0 ;
+         for (k=0 ; k<npred ; k++)
+            sum += Hmat[k*n_dim+i] * Fmat[k*n_dim+j] ;
+         TEMPmat1[i*n_dim+j] = sum ;
+         }
+      TEMPmat1[i*n_dim+i] += 1.0 ;
+      }
+   k = invert ( n_dim , TEMPmat1 , TEMPmat2 , &sum , invert_rwork , invert_iwork ) ;
+   if (k)
+      return 1 ;
+
+   // G times above
+
+   for (i=0 ; i<npred ; i++) {
+      for (j=0 ; j<n_dim ; j++) {
+         sum = 0.0 ;
+         for (k=0 ; k<n_dim ; k++)
+            sum += Gmat[i*n_dim+k] * TEMPmat2[k*n_dim+j] ;
+         Amat[i*n_dim+j] = sum ;
+         }
+      }
+
+/*
+   Update Psi = diag ( covar - H A' )
+   We limit it away from zero, because inversion of matrices becomes unstable as Psi gets small.
+   The consequence of this limiting is that, theoretically at least, increase of log likelihood
+   is no longer guaranteed.  In practice, I think decrease would be nearly impossible.
+*/
+
+   for (i=0 ; i<npred ; i++) {
+      sum = covar[i*npred+i] ;
+      for (k=0 ; k<n_dim ; k++)
+         sum -= Hmat[i*n_dim+k] * Amat[i*n_dim+k] ;
+      if (sum < 1.e-6)
+         sum = 1.e-6 ;
+      if (sum > 1.0 - 1.e-6)  // My own limit, not standard
+         sum = 1.0 - 1.e-6 ;
+      PSIvec[i] = sum ;
+      }
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   QUADstep does a single DCME-2s quadratic optimization step
+   Its input is in theta_t, and its output is in PSIvec and Amat.
+
+--------------------------------------------------------------------------------
+*/
+
+void AnalyzeFactorChild::QUADstep ( double *LLret )
+{
+   int i, nparams, ill_conditioned ;
+   double direc, alim, alim1, alim2, alim3, alim4 ;
+   double x, y, det, aa, bb, cc, dd, ee, cci, ddi, eei ;
+
+   nparams = npred + npred * n_dim ;  // Psi, A
+   *LLret = LL_t ;
+   memcpy ( best_theta , theta_t , nparams * sizeof(double) ) ;
+
+   ill_conditioned = 0 ;
+
+/*
+   Compute the three directions that will give us three new points
+   on the other side of theta, moving in the 'forward' direction
+   Psi must lie between 0 and 1
+*/
+
+
+   // ---> Point 1 <---
+
+   alim1 = 1.0 ;
+   for (i=0 ; i<npred ; i++) {
+      direc = theta_t[i] - theta_tm1[i] ;
+      if (direc > 0.0)
+         alim = (1.0 - 1.e-5 - theta_t[i]) / direc ;
+      else if (direc < 0.0)
+         alim = (1.e-5 - theta_t[i]) / direc ;
+      else
+         alim = 1.0 ;
+      if (alim < alim1)
+         alim1 = alim ;
+      }
+
+   if (alim1 < 0.01)   // Points must be spaced far enough apart to get a good quadratic curve
+      ill_conditioned = 1 ;
+   else {
+      for (i=0 ; i<nparams ; i++) {
+         direc = theta_t[i] - theta_tm1[i] ;  // Could be omitted as not needed later.  Here for clarity only.
+         trial_theta[i] = theta_t[i] + alim1 * direc ;
+         }
+      LL1 = log_lik_fast ( trial_theta ) ;
+      if (LL1 > *LLret) {
+         *LLret = LL1 ;
+         memcpy ( best_theta , trial_theta , nparams * sizeof(double) ) ;
+         }
+      if (LL1 < -1.e50)
+         ill_conditioned = 1 ;
+      }
+
+   // ---> Point 2 <---
+
+   alim2 = 1.0 ;
+   for (i=0 ; i<npred ; i++) {
+      direc = theta_t[i] - theta_tm2[i] ;
+      if (direc > 0.0)
+         alim = (1.0 - 1.e-5 - theta_t[i]) / direc ;
+      else if (direc < 0.0)
+         alim = (1.e-5 - theta_t[i]) / direc ;
+      else
+         alim = 1.0 ;
+      if (alim < alim2)
+         alim2 = alim ;
+      }
+
+   if (alim2 < 0.01)
+      ill_conditioned = 1 ;
+   else {
+      for (i=0 ; i<nparams ; i++) {
+         direc = theta_t[i] - theta_tm2[i] ;
+         trial_theta[i] = theta_t[i] + alim2 * direc ;
+         }
+      LL2 = log_lik_fast ( trial_theta ) ;
+      if (LL2 > *LLret) {
+         *LLret = LL2 ;
+         memcpy ( best_theta , trial_theta , nparams * sizeof(double) ) ;
+         }
+      if (LL2 < -1.e50)
+         ill_conditioned = 1 ;
+      }
+
+   // ---> Point 3 <---
+
+   alim3 = 1.0 ;
+   for (i=0 ; i<npred ; i++) {
+      direc = theta_tm1[i] - theta_tm2[i] ;
+      if (direc > 0.0)
+         alim = (1.0 - 1.e-5 - theta_t[i]) / direc ;
+      else if (direc < 0.0)
+         alim = (1.e-5 - theta_t[i]) / direc ;
+      else
+         alim = 1.0 ;
+      if (alim < alim3)
+         alim3 = alim ;
+      }
+
+   if (alim3 < 0.01)
+      ill_conditioned = 1 ;
+   else {
+      for (i=0 ; i<nparams ; i++) {
+         direc = theta_tm1[i] - theta_tm2[i] ;
+         trial_theta[i] = theta_t[i] + alim3 * direc ;
+         }
+      LL3 = log_lik_fast ( trial_theta ) ;
+      if (LL3 > *LLret) {
+         *LLret = LL3 ;
+         memcpy ( best_theta , trial_theta , nparams * sizeof(double) ) ;
+         }
+      if (LL3 < -1.e50)
+         ill_conditioned = 1 ;
+      }
+
+   if (ill_conditioned)   // We need all six points to be good to proceed
+      goto QUAD_FINISH ;
+
+/*
+   If we get here, we have six points: the history t0, t1, t2; the three new just found.
+   Use these to fit a quadratic surface, and then find the max of this surface.
+   Especially if we are close to the global max of LL, this will be a great improvement.
+*/
+
+   aa = (LL1 - LL_t - alim1 * alim1 * (LL_tm1 - LL_t)) / (alim1 + alim1 * alim1) ;
+   bb = (LL2 - LL_t - alim2 * alim2 * (LL_tm2 - LL_t)) / (alim2 + alim2 * alim2) ;
+   cc = LL_tm1 - LL_t + aa ;
+   dd = LL_tm2 - LL_t + bb ;
+   ee = -0.5 * (LL3 - LL_t - (aa-bb) * alim3 - (cc + dd) * alim3 * alim3) / (alim3 * alim3) ;
+
+   // Invert two-by-two H matrix
+   det = cc * dd - ee * ee ;
+   if (det > -1.e-12)
+      goto QUAD_FINISH ;
+   cci = dd / det ;
+   ddi = cc / det ;
+   eei = -ee / det ;
+
+   // Compute x and y, the max or saddle point of this quadratic fit
+   x = -0.5 * (aa * cci + bb * eei) ;
+   y = -0.5 * (aa * eei + bb * ddi) ;
+
+   alim4 = 1.0 ;
+   for (i=0 ; i<npred ; i++) {
+      direc = x * (theta_t[i] - theta_tm1[i])  +  y * (theta_t[i] - theta_tm2[i]);
+      if (direc > 0.0)
+         alim = (1.0 - 1.e-5 - theta_t[i]) / direc ;
+      else if (direc < 0.0)
+         alim = (1.e-5 - theta_t[i]) / direc ;
+      else
+         alim = 1.0 ;
+      if (alim < alim4)
+         alim4 = alim ;
+      }
+
+   if (alim4 < 0.01)  // Not worth another expensive log likelihood evaluation if this close
+      goto QUAD_FINISH ;
+   else {
+      for (i=0 ; i<nparams ; i++) {
+         direc = x * (theta_t[i] - theta_tm1[i])  +  y * (theta_t[i] - theta_tm2[i]);
+         trial_theta[i] = theta_t[i] + alim4 * direc ;
+         }
+      LL4 = log_lik_fast ( trial_theta ) ;
+      if (LL4 > *LLret) {
+         *LLret = LL4 ;
+         memcpy ( best_theta , trial_theta , nparams * sizeof(double) ) ;
+         }
+      }
+
+QUAD_FINISH:
+   memcpy ( PSIvec , best_theta , npred * sizeof(double) ) ;
+   memcpy ( Amat , best_theta+npred , npred * n_dim * sizeof(double) ) ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Compute log likelihood - Definition method (SLOW!)
+
+--------------------------------------------------------------------------------
+*/
+
+double AnalyzeFactorChild::log_lik ( double *theta )
+{
+   int i, j, k ;
+   double sum, det, *PSI, *A ;
+
+   PSI = theta ;
+   A = theta + npred ;
+
+/*
+   Sigma inverse = (Psi + A A') inverse
+   Determinant of Sigma
+*/
+
+   for (i=0 ; i<npred ; i++) {
+      for (j=0 ; j<npred ; j++) {
+         sum = 0.0 ;
+         for (k=0 ; k<n_dim ; k++)
+            sum += A[i*n_dim+k] * A[j*n_dim+k] ;
+         TEMPmat1[i*npred+j] = sum ;
+         }
+      TEMPmat1[i*npred+i] += PSI[i] ;
+      }
+   k = invert ( npred , TEMPmat1 , TEMPmat2 , &det , invert_rwork , invert_iwork ) ;
+   if (k)
+      return -1.e60 ;
+
+/*
+   Trace of above times covar
+*/
+
+   sum = 0.0 ;
+   for (i=0 ; i<npred ; i++) {
+      for (k=0 ; k<npred ; k++)
+         sum += TEMPmat2[i*npred+k] * covar[i*npred+k] ;
+      }
+
+   return -log(det) - sum ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Compute log likelihood - Fast method
+
+--------------------------------------------------------------------------------
+*/
+
+double AnalyzeFactorChild::log_lik_fast ( double *theta )
+{
+   int i, j, k ;
+   double sum, det, *PSI, *A ;
+
+   PSI = theta ;
+   A = theta + npred ;
+
+/*
+   We have to compute the inverse and determinant of sigma.
+   Done naively, this involves inverting an npred by npred matrix.
+   Done the smart (but complicated!) way, we only have to invert
+   an n_dim by n_dim matrix, which in nearly all practical cases is much smaller.
+*/
+
+   // Compute F = PsiInverse A
+
+   for (i=0 ; i<npred ; i++) {
+      for (j=0 ; j<n_dim ; j++)
+         Fmat[i*n_dim+j] = A[i*n_dim+j] / PSI[i] ;
+      }
+
+   // (A'F + I) inverse
+
+   for (i=0 ; i<n_dim ; i++) {
+      for (j=0 ; j<n_dim ; j++) {
+         sum = 0.0 ;
+         for (k=0 ; k<npred ; k++)
+            sum += A[k*n_dim+i] * Fmat[k*n_dim+j] ;
+         TEMPmat1[i*n_dim+j] = sum ;
+         }
+      TEMPmat1[i*n_dim+i] += 1.0 ;
+      }
+   k = invert ( n_dim , TEMPmat1 , TEMPmat2 , &det , invert_rwork , invert_iwork ) ;
+   if (k)
+      return -1.e60 ;
+
+   // Premultiply that by F = PsiInverse A
+
+   for (i=0 ; i<npred ; i++) {
+      for (j=0 ; j<n_dim ; j++) {
+         sum = 0.0 ;
+         for (k=0 ; k<n_dim ; k++)
+            sum += Fmat[i*n_dim+k] * TEMPmat2[k*n_dim+j] ;
+         TEMPmat1[i*n_dim+j] = sum ;
+         }
+      }
+
+   // Postmultiply that by F Transpose and simultaneously subtract it from Psi Inverse
+
+   for (i=0 ; i<npred ; i++) {
+      for (j=0 ; j<npred ; j++) {
+         if (i == j)
+            sum = 1.0 / PSI[i] ;
+         else
+            sum = 0.0 ;
+         for (k=0 ; k<n_dim ; k++)
+            sum -= TEMPmat1[i*n_dim+k] * Fmat[j*n_dim+k] ;
+         TEMPmat2[i*npred+j] = sum ;
+         }
+      }
+
+   // Trace of sigma-inverse times covar
+
+   sum = 0.0 ;
+   for (i=0 ; i<npred ; i++) {
+      for (k=0 ; k<npred ; k++)
+         sum += TEMPmat2[i*npred+k] * covar[i*npred+k] ;
+      }
+
+   // Finish computation of the determinant of Sigma
+
+   for (i=0 ; i<npred ; i++)
+      det *= PSI[i] ;
+
+   return -log(det) - sum ;
+}

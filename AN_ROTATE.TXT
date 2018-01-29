@@ -1,0 +1,88 @@
+/*
+   Compute (square root) communalities
+   This assumes that structure contains all npred columns (factors)
+   and we are rotating the first n_kept of them.
+*/
+
+   for (i=0 ; i<npred ; i++) {
+      sum = 0.0 ;
+      for (j=0 ; j<n_kept ; j++)
+         sum += structure[i*npred+j] * structure[i*npred+j] ;
+      comm[i] = sqrt ( sum ) ;
+      }
+
+/*
+   Prescale (divide) structures by (square root) communalities.
+   After rotation has converged, we'll undo this by multiplying by sqrt communalities.
+   The original version did not do this, which introduced slight bias.
+*/
+
+   for (i=0 ; i<npred ; i++) {
+      sum = comm[i] ;
+      for (j=0 ; j<n_kept ; j++)
+         structure[i*npred+j] /= sum ;
+      }
+
+/*
+--------------------------------------------
+   Main outer loop (and its initializations)
+--------------------------------------------
+*/
+
+   for (iter=0 ; iter<100 ; iter++) {   // limit is for safety and should never come even close
+      converged = 1 ;                   // We'll reset this if an adjustment is made
+      for (first_column=0 ; first_column<n_kept-1 ; first_column++) {  // We do all pairs of columns
+         for (second_column=first_column+1 ; second_column<n_kept ; second_column++) {
+            A = B = C = D = 0.0 ;       // We will sum these down the row (all vars)
+
+            // Sum down rows the quantities we will need to compute rotation angle
+
+            for (ivar=0 ; ivar<npred ; ivar++) {
+               row_ptr = structure + ivar * npred ;  // This var's row in structure matrix
+               load1 = row_ptr[first_column] ;
+               load2 = row_ptr[second_column] ;
+               Uterm = load1 * load1 - load2 * load2 ;
+               Vterm = 2.0 * load1 * load2 ;
+               A += Uterm ;
+               B += Vterm ;
+               C += Uterm * Uterm - Vterm * Vterm ;
+               D += 2.0 * Uterm * Vterm ;
+               } // For ivar
+            numer = D - 2.0 * A * B / npred ;
+            denom = C - (A * A - B * B) / npred ;
+            phi = 0.25 * atan2 ( numer , denom ) ;
+
+            // We have the angle.  Rotate if it is not tiny.
+
+            if (fabs(phi) < 1.e-10)   // No point rotating this pair of columns if angle is tiny
+               continue ;
+
+            sin_phi = sin ( phi ) ;
+            cos_phi = cos ( phi ) ;
+
+            for (ivar=0 ; ivar<npred ; ivar++) {
+               row_ptr = structure + ivar * npred ;  // This var's row in structure matrix
+               load1 = row_ptr[first_column] ;
+               load2 = row_ptr[second_column] ;
+               row_ptr[first_column] =   cos_phi * load1  +  sin_phi * load2 ;
+               row_ptr[second_column] = -sin_phi * load1  +  cos_phi * load2 ;
+               }
+
+            converged = 0 ;  // We just made an adjustment, so we are not converged
+
+            } // For second column
+         } // For first column
+
+      if (converged)
+         break ;
+      } // For iter (main outer loop)
+
+/*
+   We prescaled the structures.  Now undo that.
+*/
+
+   for (i=0 ; i<npred ; i++) {
+      sum = comm[i] ;
+      for (j=0 ; j<n_kept ; j++)
+         structure[i*npred+j] *= sum ;
+      }

@@ -1,0 +1,305 @@
+This is a set of code fragments that illustrate computation of a density plot.
+
+The following variables are especially important here
+   database     n_cases (rows) by n_vars (columns) dataset containing all data
+   grid         res by res displayable image which we compute
+   val1         Horizontal variables, which we extract from the database
+   val2         And vertical variable
+   keys         Work area, needed only for histogram equalization
+
+The user-specified parameters are as follows:
+   varnum1      Column in the database of horizontal variable
+   varnum2      Column in the database of vertical variable
+   use_lowlim1  Flag: limit the lower range of the horizontal variable?
+   lowlim_val1  Lower limit if specified by user
+   Similarly variables for upper limits and vertical variable
+   res          Vertical and horizontal resolution of the square image generated
+   width        Fraction of standard deviation used for Parzen window width
+   shift        Amount to shift displayed tone for better display
+   spread       Amount to expand displayed tone range for better display
+   type         Type of display
+      TYPE_DENSITY              Actual density
+      TYPE_MARGINAL             Marginal density product, shows 'no relationship' pattern
+      TYPE_INCONSISTENCY        Marginal inconsistency
+      TYPE_MI                   Mutual information contribution
+   hist         Apply histogram normalization?
+   sharpen      Sharpen display range to clarify boundary?
+
+
+/*
+These are memory allocations, with 'keys', 'val1', and 'val2' being work areas
+*/
+
+   grid = (double *) malloc ( 2 * res * res * sizeof(double) ) ;
+   keys = (int *) malloc ( res * res * sizeof(int) ) ;
+   val1 = (double *) malloc ( n_cases * sizeof(double) ) ;
+   val2 = (double *) malloc ( n_cases * sizeof(double) ) ;
+
+
+/*
+   Get the data from the database, with 'n_vars' being the number of columns in the database,
+   and 'n_cases' being the number of rows.
+*/
+
+   for (i=0 ; i<n_cases ; i++) {
+      val1[i] = database[i*n_vars+varnum1] ;  // Horizontal variable
+      val2[i] = database[i*n_vars+varnum2] ;  // Vertical variable
+      }
+
+
+/*
+   Find the range of each variable
+   Apply user's limits if specified, and disallow (pathological!) zero range.
+*/
+
+   smallest = largest = val1[0] ;
+   for (i=1 ; i<n_cases ; i++) {
+      if (val1[i] < smallest)
+         smallest = val1[i] ;
+      if (val1[i] > largest)
+         largest = val1[i] ;
+      }
+
+   if (use_lowlim1)
+      smallest = lowlim_val1 ;
+
+   if (use_highlim1)
+      largest = highlim_val1 ;
+
+   if (largest <= smallest) {      // Should never happen, but user may be careless
+      largest = smallest + 0.1 ;
+      smallest = largest - 0.2 ;
+      }
+
+   // Use these ranges to set up plot things, such as labels
+   // This code is omitted, as it is specific to the desired interface system
+   // We let xmin and xmax be the actual display range, which may equal or be outside (smallest, largest).
+   // Now we do the same thing for the vertical variable
+
+   smallest = largest = val2[0] ;
+   for (i=1 ; i<n_cases ; i++) {
+      if (val2[i] < smallest)
+         smallest = val2[i] ;
+      if (val2[i] > largest)
+         largest = val2[i] ;
+      }
+
+   if (use_lowlim2)
+      smallest = lowlim_val2 ;
+
+   if (use_highlim2)
+      largest = highlim_val2 ;
+
+   if (largest <= smallest) {
+      largest = smallest + 0.1 ;
+      smallest = largest - 0.2 ;
+      }
+
+
+/*
+   Compute the scale factors for the Parzen windows
+*/
+
+   scale1 = scale2 = mean1 = mean2 = 0.0 ;
+
+   for (i=0 ; i<n_cases ; i++) {
+      x = val1[i] ;
+      if (use_lowlim1  &&  x < lowlim_val1)
+         x = lowlim_val1 ;
+      if (use_highlim1  &&  x > highlim_val1)
+         x = highlim_val1 ;
+      mean1 += x ;
+      x = val2[i] ;
+      if (use_lowlim2  &&  x < lowlim_val2)
+         x = lowlim_val2 ;
+      if (use_highlim2  &&  x > highlim_val2)
+         x = highlim_val2 ;
+      mean2 += x ;
+      }
+
+   mean1 /= n_cases ;
+   mean2 /= n_cases ;
+
+   for (i=0 ; i<n_cases ; i++) {
+      x = val1[i] ;
+      if (use_lowlim1  &&  x < lowlim_val1)
+         x = lowlim_val1 ;
+      if (use_highlim1  &&  x > highlim_val1)
+         x = highlim_val1 ;
+      diff = x - mean1 ;
+      scale1 += diff * diff ;
+      x = val2[i] ;
+      if (use_lowlim2  &&  x < lowlim_val2)
+         x = lowlim_val2 ;
+      if (use_highlim2  &&  x > highlim_val2)
+         x = highlim_val2 ;
+      diff = x - mean2 ;
+      scale2 += diff * diff ;
+      }
+
+   scale1 = width * sqrt ( scale1 / n_cases ) ;
+   scale2 = width * sqrt ( scale2 / n_cases ) ;
+
+   if (scale1 < 1.e-30)   // Should never happen, but user may be careless
+      scale1 = 1.e-30 ;
+
+   if (scale2 < 1.e-30)
+      scale2 = 1.e-30 ;
+
+
+/*
+   Compute the raw display grid, before any transformations
+*/
+
+   for (i=0 ; i<res*res ; i++)
+      grid[i] = 0.0 ;  // Avoid nan in case user aborts
+
+   total_joint = 0.0 ;
+
+   for (horz=0 ; horz<res ; horz++) {
+      x = xmin + horz * (xmax - xmin) / (res - 1) ;
+      for (vert=0 ; vert<res ; vert++) {
+         y = ymin + vert * (ymax - ymin) / (res - 1) ;
+         xmarg = ymarg = joint = 0.0 ;
+         for (i=0 ; i<n_cases ; i++) {
+            xdiff = (val1[i] - x) / scale1 ;
+            ydiff = (val2[i] - y) / scale2 ;
+            xmarg += exp ( -0.5 * xdiff * xdiff ) ;
+            ymarg += exp ( -0.5 * ydiff * ydiff ) ;
+            joint += exp ( -0.5 * (xdiff * xdiff + ydiff * ydiff) ) ;
+            }
+         xmarg /= n_cases * scale1 * root_two_pi ;
+         ymarg /= n_cases * scale2 * root_two_pi ;
+         joint /= n_cases * scale1 * scale2 * two_pi ;
+         if (xmarg < 1.e-50)
+            xmarg = 1.e-50 ;
+         if (ymarg < 1.e-50)
+            ymarg = 1.e-50 ;
+         if (joint < 1.e-100)
+            joint = 1.e-100 ;
+
+         if (type == TYPE_DENSITY)
+            grid[vert*res+horz] = log ( joint ) ;
+         else if (type == TYPE_MARGINAL)
+            grid[vert*res+horz] = log ( xmarg ) + log ( ymarg ) ;
+         else {  // INCONSISTENCY or MI
+            numer = joint ;
+            if (numer < 1.e-100)
+               numer = 1.e-100 ;
+            denom = xmarg * ymarg ;
+            if (denom < 1.e-100)
+               denom = 1.e-100 ;
+            grid[vert*res+horz] = log ( numer ) - log ( denom ) ; // Inconsistency
+            if (type == TYPE_MI) {   // If user wants mutual information
+               total_joint += numer ;
+               grid[vert*res+horz] *= numer ;
+               }
+            }
+         }
+      } // For horz
+
+
+   if (type == TYPE_MI) {   // If user wants mutual information
+      totalMI = 0.0 ;
+      maxMI = -1.e100 ;
+      for (horz=0 ; horz<res ; horz++) {
+         x = xmin + horz * (xmax - xmin) / (res - 1) ;
+         for (vert=0 ; vert<res ; vert++) {
+            y = ymin + vert * (ymax - ymin) / (res - 1) ;
+            grid[vert*res+horz] /= total_joint ;  // Normalize (Does not impact display; just makes printed MI sensible)
+            totalMI += grid[vert*res+horz] ;      // Guaranteed non-negative
+            if (grid[vert*res+horz] > maxMI) {
+               maxMI = grid[vert*res+horz] ;
+               maxMIx = x ;
+               maxMIy = y ;
+               }
+            }
+         }
+      if (totalMI > 0.0)
+         maxMI *= res * res / totalMI ;
+      else
+         maxMI = 0.0 ;
+      }
+
+   if (type == TYPE_INCONSISTENCY) {   // If user wants inconsistency
+      max_pos = max_neg = 1.e-20 ;
+      for (i=0 ; i<res*res ; i++) {
+        if (grid[i] > 0.0  &&  grid[i] > max_pos)
+           max_pos = grid[i] ;
+        if (grid[i] < 0.0  &&  (-grid[i]) > max_neg)
+           max_neg = -grid[i] ;
+         }
+      for (i=0 ; i<res*res ; i++) {
+         if (grid[i] > 0.0)
+            grid[i] /= max_pos ;
+         if (grid[i] < 0.0)
+            grid[i] /= -max_neg ;
+         }
+      }
+
+   if (hist) {
+/*
+   Sort the grid entries so we can compute fractiles.
+   Recall that we allocated twice the needed space to allow for sorted array.
+   Then convert each grid entry into its fractile.
+*/
+
+      for (i=0 ; i<res*res ; i++)
+         keys[i] = i ;
+
+      sorted = grid + res * res ;  // Use last half for scratch
+      memcpy ( sorted , grid , res * res * sizeof(double) ) ;
+      qsortdsi ( 0 , res * res - 1 , sorted , keys ) ;
+   
+      for (i=0 ; i<res*res ; i++)
+         grid[keys[i]] = (double) i / (res * res - 1.0) ;
+      if (sharpen) {
+         for (i=0 ; i<res*res ; i++)
+            grid[i] = grid[i] * grid[i] * grid[i] ;
+         }
+      } // Histogram equalization
+
+   else {  // We scale by using ALMOST extremes
+      sorted = grid + res * res ;  // Use last half for scratch
+      for (i=0 ; i<res*res ; i++)
+         sorted[i] = grid[i] ;
+      qsortd ( 0 , res * res - 1 , sorted ) ;
+      i = (int) (0.01 * res * res) ;
+      smallest = sorted[i] ;
+      largest = sorted[res*res-i-1] ;
+      mult = 1.0 / (largest - smallest + 1.e-20) ;
+      for (i=0 ; i<res*res ; i++) {
+         grid[i] = mult * (grid[i] - smallest) ;
+         if (grid[i] > 1.0)
+            grid[i] = 1.0 ;
+         if (grid[i] < 0.0)
+            grid[i] = 0.0 ;
+         if (sharpen)
+            grid[i] = grid[i] * grid[i] * grid[i] ;
+         }
+      } // No histogram equalization
+
+
+
+/*
+   Apply the user's visual transform
+*/
+
+   if (spread >= 0.0)
+      mult = spread + 1.0 ;
+   else
+      mult = 1.0 / (1.0 - spread) ;
+
+   for (i=0 ; i<res*res ; i++) {
+      grid[i] += 0.01 * shift ;
+      if (grid[i] < 1.e-12)       // Needed for log below
+         grid[i] = 1.e-12 ;
+      if (grid[i] > 1.0 - 1.e-12) // Ditto
+         grid[i] = 1.0 - 1.e-12 ;
+
+      if (grid[i] <= 0.5)
+         grid[i] = 0.5 * exp ( mult * log ( 2.0 * grid[i] )) ;
+      else 
+         grid[i] = 1.0 - 0.5 * exp ( mult * log ( 2.0 * (1.0 - grid[i]) )) ;
+      }
+}

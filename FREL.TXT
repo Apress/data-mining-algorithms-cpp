@@ -1,0 +1,755 @@
+/**********************************************************************************/
+/*                                                                                */
+/*  FREL - All routines for FREL between predictors and a target                  */
+/*                                                                                */
+/*  Other screen routines thread predictor candidates.                            */
+/*  But FREL processes all candidates simultaneously, so this threads             */
+/*  bootstraps in ensemble FREL.                                                  */
+/*                                                                                */
+/*  This file contains core code fragments                                        */
+/*                                                                                */
+/**********************************************************************************/
+
+/*
+--------------------------------------------------------------------------------
+
+   Subroutine to find the loss over a block of cases
+
+--------------------------------------------------------------------------------
+*/
+
+static double block_loss (
+   int istart ,                 // Index of case being tested
+   int istop ,                  // And one past last case
+   int *indices ,               // Index of cases; facilitates bootstraps
+   int npred ,                  // Number of predictors
+   int *preds ,                 // Their indices are here
+   int ncases ,                 // Number of cases in this bootstrap
+   int n_vars ,                 // Number of columns in database
+   double *database ,           // Full database
+   int *target_bin ,            // Ncases vector of target bin indices
+   double *weights              // Input of weight wector being tried
+   )
+{
+   int k, ivar, icase, inner, iclass, /* ibest, iworst, */ inner_index, outer_index ;
+   double *cptr, *tptr, distance, ebest, eworst, loss ;
+
+
+   loss = 0.0 ;
+   for (icase=istart ; icase<istop ; icase++) {
+      outer_index = indices[icase] ;              // Index of this case in database
+      iclass = target_bin[outer_index] ;          // Its class
+      cptr = database + outer_index * n_vars ;    // Its predictors in database
+      ebest = eworst = 1.e60 ;
+
+      for (inner=0 ; inner<ncases ; inner++) {    // Test against all other cases
+         inner_index = indices[inner] ;
+         if (inner_index == outer_index)          // Don't test it against itself
+            continue ;
+         tptr = database + inner_index * n_vars ; // Predictors of inner case in database
+
+         // Compute the distance of this case from the test case
+         distance = 0.0 ;
+         for (ivar=0 ; ivar<npred ; ivar++) {     // For all predictors
+            k = preds[ivar] ;                     // Index of this predictor in database
+            distance += weights[ivar] * fabs ( cptr[k] - tptr[k] ) ;
+            }
+
+         // Find the closest neighbor in this class and in any other class
+         if (target_bin[inner_index] == iclass) {
+            if (distance < ebest)
+               ebest = distance ;
+            }
+
+         else {
+            if (distance < eworst)
+               eworst = distance ;
+            }
+         } // For inner, the test cases
+
+      distance = ebest - eworst ;
+      if (distance > 30.0)
+         loss += distance ;
+      else
+         loss += log ( 1.0 + exp ( distance ) ) ;
+      } // For icase
+
+   return loss ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Thread stuff...
+      Structure for passing information to/from threaded code
+      Threaded code called by the main subroutine
+
+--------------------------------------------------------------------------------
+*/
+
+typedef struct {
+   int istart ;              // Index of first case being tested
+   int istop ;               // And one past last case
+   int *indices ;            // Index of cases; facilitates bootstraps
+   int npred ;               // Number of predictors
+   int *preds ;              // Their indices are here
+   int ncases ;              // Number of cases in this bootstrap
+   int n_vars ;              // Number of columns in database
+   double *database ;        // Full database
+   int *target_bin ;         // Bin index for targets
+   double *weights ;         // Weight vector
+   double *loss ;            // Computed loss function value is returned here
+} FREL_PARAMS ;
+
+
+static unsigned int __stdcall block_loss_threaded ( LPVOID dp )
+{
+   *(((FREL_PARAMS *) dp)->loss) = block_loss ( ((FREL_PARAMS *) dp)->istart ,
+                        ((FREL_PARAMS *) dp)->istop ,
+                        ((FREL_PARAMS *) dp)->indices ,
+                        ((FREL_PARAMS *) dp)->npred ,
+                        ((FREL_PARAMS *) dp)->preds ,
+                        ((FREL_PARAMS *) dp)->ncases ,
+                        ((FREL_PARAMS *) dp)->n_vars ,
+                        ((FREL_PARAMS *) dp)->database ,
+                        ((FREL_PARAMS *) dp)->target_bin ,
+                        ((FREL_PARAMS *) dp)->weights ) ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Subroutine to compute the loss function
+   This breaks the dataset into threaded blocks
+
+--------------------------------------------------------------------------------
+*/
+
+static double loss (
+   int npred ,                  // Number of predictors
+   int *preds ,                 // Their indices are here
+   int ncases ,                 // Number of cases in this bootstrap
+   int n_vars ,                 // Number of columns in database
+   int *indices ,               // Index of cases; facilitates bootstraps
+   double *database ,           // Full database
+   int *target_bin ,            // Ncases vector of target bin indices
+   double *weights ,            // Input of weight wector being tried
+   double regfac                // Regularization factor
+   )
+{
+   int i, ivar, ithread, n_threads, n_in_batch, n_done, istart, istop, ret_val ;
+   double loss[MAX_THREADS], total_loss ;
+   FREL_PARAMS frel_params[MAX_THREADS] ;
+   HANDLE threads[MAX_THREADS] ;
+
+   n_threads = MAX_THREADS ;
+   if (n_threads > ncases)
+      n_threads = 1 ;
+
+/*
+   Initialize those thread parameters which are constant for all threads.
+*/
+
+   for (ithread=0 ; ithread<n_threads ; ithread++) {
+      frel_params[ithread].npred = npred ;
+      frel_params[ithread].preds = preds ;
+      frel_params[ithread].ncases = ncases ;
+      frel_params[ithread].n_vars = n_vars ;
+      frel_params[ithread].indices = indices ;
+      frel_params[ithread].database = database ;
+      frel_params[ithread].target_bin = target_bin ;
+      frel_params[ithread].weights = weights ;
+      frel_params[ithread].loss = &loss[ithread] ;
+      } // For all threads, initializing constant stuff
+
+   istart = 0 ;         // Batch start = training data start
+   n_done = 0 ;         // Number of training cases done so far
+
+
+   for (ithread=0 ; ithread<n_threads ; ithread++) {
+      n_in_batch = (ncases - n_done) / (n_threads - ithread) ;  // Cases left to do / batches left to do
+      istop = istart + n_in_batch ;                             // Stop just before this index
+
+      // Set the pointers that vary with the batch
+
+      frel_params[ithread].istart = istart ;
+      frel_params[ithread].istop = istop ;
+
+      threads[ithread] = (HANDLE) _beginthreadex ( NULL , 0 , block_loss_threaded , &frel_params[ithread] , 0 , NULL ) ;
+      if (threads[ithread] == NULL) {
+         for (i=0 ; i<n_threads ; i++) {
+            if (threads[i] != NULL)
+               CloseHandle ( threads[i] ) ;
+            }
+         return -1.e40 ;
+         }
+
+      n_done += n_in_batch ;
+      istart = istop ;
+      } // For all threads / batches
+
+/*
+   Wait for threads to finish, and then cumulate all results
+*/
+
+   ret_val = WaitForMultipleObjects ( n_threads , threads , TRUE , 1200000 ) ;
+   if (ret_val == WAIT_TIMEOUT  ||  ret_val == WAIT_FAILED  ||  ret_val < 0  ||  ret_val >= n_threads) {
+      for (ithread=0 ; ithread<n_threads ; ithread++)
+         CloseHandle ( threads[ithread] ) ;
+      audit ( "" ) ;
+      audit ( "INTERNAL ERROR... Thread timeout in FREL.CPP" ) ;
+      return -1.e40 ;
+      }
+
+   total_loss = 0.0 ;
+   for (ithread=0 ; ithread<n_threads ; ithread++) {
+      total_loss += loss[ithread] ;
+      CloseHandle ( threads[ithread] ) ;
+      }
+
+   total_loss /= ncases ;   // Make it a per-case average
+
+   // Add in the regularization penalty
+   for (ivar=0 ; ivar<npred ; ivar++)
+      total_loss += regfac * weights[ivar] * weights[ivar] ;
+
+   return total_loss ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Subroutine to compute optimal weight vector
+
+--------------------------------------------------------------------------------
+*/
+
+
+static int criter ( double *x , double *y ) ;
+static int local_npred ;
+static int *local_preds ;
+static int local_ncases ;
+static int local_n_vars ;
+static int *local_indices ;
+static double *local_database ;
+static int *local_target_bin ;
+static double *local_critwork ;
+static double local_regfac ;
+
+static int compute_wt (
+   int npred ,              // Number of predictors
+   int *preds ,             // Their indices are here
+   int ncases ,             // Number of cases
+   int n_vars ,             // Number of columns in database
+   int *indices ,           // Index of cases; facilitates bootstraps
+   double *database ,       // Full database
+   int nbins_target ,       // Number of target bins
+   int *target_bin ,        // Ncases vector of target bin indices
+   int nboot,               // Number of bootstrap reps
+   int bootsize ,           // Size of each bootstrap
+   double *crits ,          // Predictor weights for each bootstrap computed here
+   double *critwork ,       // Work vector npred long needed by criter()
+   double *base ,           // Work vector npred long for powell()
+   double *p0 ,             // Work vector npred long for powell()
+   double *direc ,          // Work vector npred*npred long for powell()
+   int irep ,               // Replication number, needed only for progress display
+   int mcpt_reps ,          // Number of MCPT replications
+   double regfac ,          // Regularization factor
+   double *loss_value ,     // Optimal loss (sum of bootstrap losses) is returned here
+   double *weights          // Weight vector returned here
+   )
+{
+   int i, j, k, m, iboot, ret_val, class_count[MAX_MUTINF_BINS] ;
+   double loss ;
+   char msg[2014] ;
+#if DEBUG > 2
+   char msg2[256] ;
+#endif
+
+   // These are needed by criter()
+   local_npred = npred ;
+   local_preds = preds ;
+   local_ncases = bootsize ;
+   local_n_vars = n_vars ;
+   local_indices = indices ;
+   local_database = database ;
+   local_target_bin = target_bin ;
+   local_critwork = critwork ;
+   local_regfac = regfac ;
+
+   for (i=0 ; i<npred ; i++)   // Results of bootstraps will be summed in 'weights'
+      weights[i] = 0.0 ;
+   *loss_value = 0.0 ;         // Will be needed for global p-value
+
+   for (i=0 ; i<ncases ; i++)
+      indices[i] = i ;
+
+   // Bootstrap loop
+
+   for (iboot=0 ; iboot<nboot ; iboot++) {
+
+      sprintf_s ( msg , "Replication %d of %d  Bootstrap %d of %d",
+                  irep+1, mcpt_reps, iboot+1, nboot ) ;
+      // Display progress update here if desired
+
+      // Because we use a nearest-neighbor algorithm, no case can be replicated.
+      // The easiest way to select without replacement is to shuffle in place
+      // and stop when we reach the bootstrap size.
+      // Make sure we have at least two members of each class in this bootstrap sample
+
+      for (i=0 ; i<nbins_target ; i++)
+         class_count[i] = 0 ;
+
+      i = ncases ;            // Number remaining to be shuffled
+      while (i > 1) {         // While at least 2 left to shuffle
+         m = ncases - i ;     // Number shuffled so far
+         if (m >= bootsize)
+            break ;
+         j = (int) (unifrand_fast () * i) ;
+         if (j >= i)          // Should never happen, but be safe
+            j = i - 1 ;
+         k = indices[m] ;
+         indices[m] = indices[m+j] ;
+         indices[m+j] = k ;
+         --i ;
+         ++class_count[target_bin[indices[m]]] ;
+         }
+
+
+      for (i=0 ; i<nbins_target ; i++) {
+         if (class_count[i] < 2)
+            break ;
+         }
+
+      if (i < nbins_target) {
+         --iboot ;
+         continue ;
+         }
+
+      for (i=0 ; i<npred ; i++)   // Starting point for this bootstrap
+         crits[i] = 0.0 ;
+
+
+      ret_val = criter ( crits , &loss ) ;
+      ret_val = powell ( 0.1 , 10 , 0.0 , 1.e-3 , criter , npred ,
+                         crits , &loss , base , p0 , direc , 1 ) ;
+      *loss_value += loss ;
+
+      if (ret_val) {
+         audit ( "" ) ;
+         audit ( "ERROR... User pressed ESCape during FREL" ) ;
+         return ret_val ;
+         }
+
+      for (i=0 ; i<npred ; i++)   // Cumulate for this bootstrap
+         weights[i] += crits[i] ;
+
+      } // For iboot
+
+
+   for (i=0 ; i<npred ; i++)
+      weights[i] /= nboot ;
+
+   return 0 ;
+}
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Criterion function called by powell()
+
+--------------------------------------------------------------------------------
+*/
+
+static int criter ( double *x , double *y )
+{
+   int i ;
+   double crit, penalty ;
+
+   penalty = 0.0 ;  // This is not really regularization.  It just keeps the parameters reasonable.
+
+   for (i=0 ; i<local_npred ; i++) {
+      if (x[i] > 4.0) {
+         local_critwork[i] = exp ( 4.0 ) + x[i] - 4.0 ;
+         penalty += (x[i] - 4.0) * (x[i] - 4.0) ;
+         }
+      else if (x[i] < -3.0) {
+         local_critwork[i] = exp ( -3.0 ) + x[i] + 3.0 ;
+         penalty += (x[i] + 3.0) * (x[i] + 3.0) ;
+         }
+      else
+         local_critwork[i] = exp ( x[i] ) ;
+      }
+
+   crit = loss ( local_npred , local_preds , local_ncases , local_n_vars ,
+                 local_indices , local_database , local_target_bin , local_critwork ,
+                 local_regfac ) ;
+
+   *y = crit + penalty ;
+
+   if (escape_key_pressed  ||  user_pressed_escape())
+      return escape_key_pressed ;
+
+   return 0 ;
+}
+
+/*
+--------------------------------------------------------------------------------
+
+   Main subroutine to compute and print FREL study
+
+--------------------------------------------------------------------------------
+*/
+
+int frel (
+   int npred ,            // Number of predictors
+   int *preds ,           // Their indices are here
+   int targetvar ,        // Index of target variable
+   int nbins_target ,     // Number of target bins, 0 for 2 sign-based bins
+   double regfac ,        // Regularization factor
+   int nboot,             // Number of bootstrap reps
+   int bootsize ,         // Size of each bootstrap
+   int mcpt_type ,        // 1=complete, 2=cyclic
+   int mcpt_reps          // Number of MCPT replications, <=1 for no MCPT
+   )
+{
+   int i, j, k, ret_val, ivar, irep, *index, *indices ;
+   int *mcpt_solo, *mcpt_bestof, mcpt_loss ;
+   int *target_bin, *work_bin ;
+   double *pred, *target, target_thresholds[MAX_MUTINF_BINS] ;
+   double *crits, *weights, *original_weights, *sorted_weights, best_crit, sum ;
+   double target_marginal[MAX_MUTINF_BINS] ;
+   double *critwork, *base, *p0, *direc ;
+   double loss, original_loss ;
+   char msg[1024], msg2[256] ;
+
+   MEMTEXT ( "FREL: frel() starting" ) ;
+
+   if (bootsize == 0  ||  bootsize >= n_cases  || nboot <= 1) {
+      nboot = 1 ;
+      bootsize = n_cases ;
+      }
+
+   pred = NULL ;
+   target_bin = NULL ;
+   crits = NULL ;
+   index = NULL ;
+   critwork = NULL ;
+
+   ret_val = 0 ;
+
+
+   audit ( "" ) ;
+   audit ( "" ) ;
+   audit ( "**********************************************************************************" ) ;
+   audit ( "*                                                                                *" ) ;
+   audit ( "* Computing FREL (Feature weighting as regularized energy-based learning)        *" ) ;
+   sprintf_s ( msg, "* %5d predictor candidates                                                     *", npred ) ;
+   audit ( msg ) ;
+   sprintf_s ( msg, "*    %2d target bins                                                              *", nbins_target ) ;
+   audit ( msg ) ;
+   sprintf_s ( msg, "*       Regularization =%7.4lf                                                  *", regfac ) ;
+   audit ( msg ) ;
+   if (nboot > 1) {
+      sprintf_s ( msg, "* %5d bootstrap iterations                                                     *", nboot ) ;
+      audit ( msg ) ;
+      sprintf_s ( msg, "* %5d cases per bootstrap iteration                                            *", bootsize ) ;
+      audit ( msg ) ;
+      }
+   else {
+      sprintf_s ( msg, "*       No bootstrap (full dataset used exactly once)                            *" ) ;
+      audit ( msg ) ;
+      }
+   if (mcpt_reps > 1) {
+      if (mcpt_type == 1)
+         sprintf_s ( msg, "* %5d replications of complete Monte-Carlo Permutation Test                    *", mcpt_reps ) ;
+      else if (mcpt_type == 2)
+         sprintf_s ( msg, "* %5d replications of cyclic Monte-Carlo Permutation Test                      *", mcpt_reps ) ;
+      audit ( msg ) ;
+      }
+   else {
+      sprintf_s ( msg, "*       No Monte-Carlo Permutation Test                                          *" ) ;
+      audit ( msg ) ;
+      }
+   audit ( "*                                                                                *" ) ;
+   audit ( "**********************************************************************************" ) ;
+
+
+/*
+   Allocate memory
+*/
+
+   pred = (double *) malloc ( 2 * n_cases * sizeof(double) ) ;  // Pred, target
+   target = pred + n_cases ;
+
+   target_bin = (int *) malloc ( 3 * n_cases * sizeof(int) ) ;
+   work_bin = target_bin + n_cases ;
+   indices = work_bin + n_cases ;
+
+   crits = (double *) malloc ( 4 * npred * sizeof(double) ) ;
+   weights = crits + npred ;
+   original_weights = weights + npred ;
+   sorted_weights = original_weights + npred ;
+
+   index = (int *) malloc ( 3 * npred * sizeof(int) ) ;   // Index, mcpt_solo, mcpt_bestof
+   mcpt_solo = index + npred ;
+   mcpt_bestof = mcpt_solo + npred ;
+
+   critwork = (double *) malloc ( (3 * npred + npred*npred) * sizeof(double) ) ;  // Work for criter() and powell()
+   base = critwork + npred ;
+   p0 = base + npred ;
+   direc = p0 + npred ;
+
+   if (pred == NULL  ||  target_bin == NULL  ||  crits == NULL  ||  index == NULL  ||  critwork == NULL) {
+      ret_val = ERROR_INSUFFICIENT_MEMORY ;
+      goto FINISH ;
+      }
+
+/*
+   Make an initial pass through the data to find target thresholds
+*/
+
+   for (i=0 ; i<n_cases ; i++)               // Extract target from database
+      target[i] = database[i*n_vars+targetvar] ;
+   k = nbins_target ;
+   partition ( n_cases , target , &k , target_thresholds , target_bin ) ;
+   if (k < nbins_target) {
+      sprintf_s ( msg, "ERROR: Numerous ties reduced target bins to %d", k ) ;
+      audit ( msg ) ;
+      ret_val = ERROR_SYNTAX ;
+      goto FINISH ;
+      }
+   assert ( k == nbins_target ) ;
+
+
+/*
+   All target thresholds are computed and saved, and target bins computed.
+   Print the thresholds for the user's edification
+*/
+
+   audit ( "" ) ;
+   audit ( "" ) ;
+   audit ( "Target bounds..." ) ;
+   sprintf_s ( msg , "%12.5lf", target_thresholds[0] ) ;
+   for (i=1 ; i<nbins_target-1 ; i++) {
+      sprintf_s ( msg2 , "  %12.5lf", target_thresholds[i] ) ;
+      strcat_s ( msg , msg2 ) ;
+      }
+   audit ( msg ) ;
+   audit ( "" ) ;
+
+
+/*
+   Compute and print target marginal
+*/
+
+   for (i=0 ; i<nbins_target ; i++)
+      target_marginal[i] = 0.0 ;
+
+   for (i=0 ; i<n_cases ; i++) {
+      assert ( target_bin[i] < nbins_target ) ;
+      ++target_marginal[target_bin[i]] ;
+      }
+
+   for (i=0 ; i<nbins_target ; i++)
+      target_marginal[i] /= n_cases ;
+
+   audit ( "Target marginals..." ) ;
+   sprintf_s ( msg , "%12.5lf", target_marginal[0] ) ;
+   for (i=1 ; i<nbins_target ; i++) {
+      sprintf_s ( msg2 , "  %12.5lf", target_marginal[i] ) ;
+      strcat_s ( msg , msg2 ) ;
+      }
+
+   audit ( msg ) ;
+         audit ( "" ) ;
+
+
+/*
+--------------------------------------------------------------------------------
+
+   Outer-most loop does MCPT replications
+
+--------------------------------------------------------------------------------
+*/
+
+   if (mcpt_reps < 1)
+      mcpt_reps = 1 ;
+
+   for (irep=0 ; irep<mcpt_reps ; irep++) {
+
+/*
+   Shuffle target if in permutation run (irep>0)
+*/
+
+      if (irep) {                   // If doing permuted runs, shuffle
+
+         if (mcpt_type == 1) {      // Complete
+            i = n_cases ;           // Number remaining to be shuffled
+            while (i > 1) {         // While at least 2 left to shuffle
+               j = (int) (unifrand_fast () * i) ;
+               if (j >= i)          // Should never happen, but be safe
+                  j = i - 1 ;
+               k = target_bin[--i] ;
+               target_bin[i] = target_bin[j] ;
+               target_bin[j] = k ;
+               }
+            } // Type 1, Complete
+
+         else if (mcpt_type == 2) {    // Cyclic
+            j = (int) (unifrand_fast () * n_cases) ;
+            if (j >= n_cases)
+               j = n_cases - 1 ;
+            for (i=0 ; i<n_cases ; i++)
+               work_bin[i] = target_bin[(i+j)%n_cases] ;
+            for (i=0 ; i<n_cases ; i++)
+               target_bin[i] = work_bin[i]  ;
+            } // Type 2, Cyclic
+
+         } // If in permutation run (irep > 0)
+
+
+/*
+-----------------------------------------------------------------------------------
+
+   Do it
+
+-----------------------------------------------------------------------------------
+*/
+
+      ret_val = compute_wt ( npred , preds , n_cases , n_vars , indices , database ,
+                             nbins_target , target_bin , nboot , bootsize ,
+                             crits , critwork , base , p0 , direc , irep ,
+                             mcpt_reps , regfac , &loss , weights ) ;
+
+      if (ret_val) {
+         audit ( "" ) ;
+         audit ( "ERROR... User pressed ESCape" ) ;
+         goto FINISH ;
+         }
+
+
+/*
+   Normalize the weights.  This not only helps interpretation, but also handles
+   a subtle problem with MCPT tests.  If even one predictor is good, all weights
+   (even those of worthless predictors) will be unusually large.
+   Without normalization, this inflates significance!
+   We also multiply by the standard deviation to compensate for different scaling,
+   which we do not want to distort order of weights.
+*/
+
+      sum = 0.0 ;
+      for (ivar=0 ; ivar<npred ; ivar++) {
+         weights[ivar] = var_stddevs[preds[ivar]] * exp ( weights[ivar] ) ;
+         sum += weights[ivar] ;
+         }
+
+      for (ivar=0 ; ivar<npred ; ivar++)
+         weights[ivar] *= 100.0 / sum ;
+
+/*
+   The weight criterion for each predictor has been computed and saved in weights.
+   Update the MCPT.
+*/
+
+      for (ivar=0 ; ivar<npred ; ivar++) {
+
+         if (ivar == 0  ||  weights[ivar] > best_crit)
+            best_crit = weights[ivar] ;
+
+         if (irep == 0) {            // Original, unpermuted data
+            sorted_weights[ivar] = original_weights[ivar] = weights[ivar] ;
+            index[ivar] = ivar ;
+            mcpt_bestof[ivar] = mcpt_solo[ivar] = 1 ;
+            }
+
+         else if (weights[ivar] >= original_weights[ivar])
+            ++mcpt_solo[ivar] ;
+
+         } // For all predictor candidates
+
+
+      if (irep == 0) {  // Get the indices that sort the predictors' criterion
+         original_loss = loss ;
+         mcpt_loss = 1 ;
+         qsortdsi ( 0 , npred-1 , sorted_weights , index ) ;
+         }
+
+      else {
+         if (loss <= original_loss)
+            ++mcpt_loss ;
+         for (ivar=0 ; ivar<npred ; ivar++) {
+            if (best_crit >= original_weights[ivar]) // Valid only for largest
+               ++mcpt_bestof[ivar] ;
+            }
+         }
+
+      } // For all MCPT replications
+
+
+/*
+--------------------------------------------------------------------------------
+
+   All main computation is finished.  Print results.
+
+--------------------------------------------------------------------------------
+*/
+
+   audit ( "" ) ;
+   audit ( "" ) ;
+   sprintf_s ( msg, "------------------------------> FREL with %s <------------------------------", var_names[targetvar] ) ;
+   audit ( msg ) ;
+   audit ( "" ) ;
+   audit ( "" ) ;
+   strcpy_s ( msg , "       Variable       Weight" ) ;
+   if (mcpt_reps > 1)
+      strcat_s ( msg, "      Solo pval  Unbiased pval" ) ;
+   audit ( msg ) ;
+   audit ( "" ) ;
+
+   for (i=npred-1 ; i>=0 ; i--) {
+      k = index[i] ;
+      sprintf_s ( msg, "%15s %12.4lf",
+                var_names[preds[k]], original_weights[k] ) ;
+      if (mcpt_reps > 1) {
+         sprintf_s ( msg2, " %12.4lf %12.4lf",
+                   (double) mcpt_solo[k] / (double) mcpt_reps,
+                   (double) mcpt_bestof[k] / (double) mcpt_reps ) ;
+         strcat_s ( msg , msg2 ) ;
+         }
+      audit ( msg ) ;
+      }
+
+   if (mcpt_reps > 1) {
+      audit ( "" ) ;
+      sprintf_s ( msg, "Loss p-value = %.3lf", (double) mcpt_loss / (double) mcpt_reps ) ;
+      audit ( msg ) ;
+      }
+
+
+/*
+   Finished.  Clean up and exit.
+*/
+
+FINISH:
+
+   if (pred != NULL)
+      free ( pred ) ;
+   if (target_bin != NULL)
+      free ( target_bin ) ;
+   if (crits != NULL)
+      free ( crits ) ;
+   if (critwork != NULL)
+      free ( critwork ) ;
+   if (index != NULL)
+      free ( index ) ;
+
+   MEMTEXT ( "frel() ending" ) ;
+   return ret_val ;
+}
